@@ -52,35 +52,6 @@ def get_windows_display_name() -> str:
     except Exception as exc:
         log_event("config", f"get_windows_display_name fallback to getuser: {exc}", level="INFO")
     return getpass.getuser()
-def _default_export_folder() -> str:
-    """Try to auto-detect the Teams/SharePoint-synced Reports folder.
-
-    The Teams sync folder is always directly under C:\\Users\\<user>\\<OrgName>\\
-    and does NOT contain 'OneDrive' in its path — that would be the personal
-    OneDrive which is the wrong target.
-    """
-    import glob
-    user = getpass.getuser()
-
-    # Explicit known patterns for Teams SharePoint sync (no OneDrive in path)
-    candidates = [
-        os.path.join("C:\\Users", user, "Envista", "SPARK-GLB-OPS-ICON - Reports"),
-        os.path.join("C:\\Users", user, "Envista", "SPARK-GLB-OPS-ICON - Daily Production", "Reports"),
-    ]
-
-
-    for pattern in [
-        os.path.join("C:\\Users", user, "Envista", "*Reports*"),
-        os.path.join("C:\\Users", user, "Envista", "*", "Reports"),
-    ]:
-        for p in glob.glob(pattern):
-            if "onedrive" not in p.lower():
-                candidates.append(p)
-
-    for path in candidates:
-        if "onedrive" not in path.lower() and os.path.isdir(path):
-            return path
-    return ""
 
 
 _DEFAULTS = {
@@ -110,23 +81,6 @@ def _load_shared_config(export_folder: str) -> dict:
     return {}
 
 
-def save_shared_config(cfg: dict) -> bool:
-    """Save team-wide settings to _shared_config.json in the shared folder."""
-    export_folder = cfg.get("export_folder", "").strip()
-    if not export_folder:
-        export_folder = load_config().get("export_folder", "").strip()
-    if not export_folder or not os.path.isdir(export_folder):
-        return False
-    shared_path = os.path.join(export_folder, "_shared_config.json")
-    try:
-        with open(shared_path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception as exc:
-        log_event("config", f"save_shared_config({shared_path}): {exc}", level="WARN")
-        return False
-
-
 def load_config() -> dict:
     """Return the config dict (merged with defaults for any missing keys)."""
     cfg = dict(_DEFAULTS)
@@ -137,9 +91,6 @@ def load_config() -> dict:
             cfg.update(stored)
         except Exception as exc:
             log_event("config", f"load_config({_CONFIG_PATH}): {exc}", level="WARN")
-    # Auto-detect export folder if not set yet
-    if not cfg.get("export_folder"):
-        cfg["export_folder"] = _default_export_folder()
     # Pre-fill designer name from Windows if never set
     if not cfg.get("designer_name"):
         cfg["designer_name"] = get_windows_display_name()
@@ -175,8 +126,3 @@ def save_config(cfg: dict) -> None:
     os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
     with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-
-def is_configured() -> bool:
-    """Return True if the export folder has been set."""
-    return bool(load_config().get("export_folder", "").strip())

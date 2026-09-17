@@ -5,7 +5,6 @@ Startup safety backups.
 Creates timestamped copies of critical local data before normal app activity:
   - cases.db
   - local config.json
-  - shared _shared_config.json (if export folder exists)
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ from datetime import datetime
 
 from db.database import DB_PATH
 from sync import get_local_app_dir
-from sync.app_config import load_config
 from sync.app_logger import log_event
 
 
@@ -74,16 +72,6 @@ def run_startup_backups() -> dict:
     cfg_dst = os.path.join(cfg_dir, f"config_{now}.json")
     if _safe_copy(local_cfg, cfg_dst):
         counters["config"] += 1
-
-    try:
-        cfg = load_config()
-        export_folder = cfg.get("export_folder", "").strip()
-        shared_src = os.path.join(export_folder, "_shared_config.json") if export_folder else ""
-        shared_dst = os.path.join(shared_dir, f"_shared_config_{now}.json")
-        if _safe_copy(shared_src, shared_dst):
-            counters["shared"] += 1
-    except Exception as exc:
-        log_event("backup", f"shared config backup failed: {exc}", level="WARN")
 
     _prune_old_backups(db_dir)
     _prune_old_backups(cfg_dir)

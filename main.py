@@ -103,57 +103,10 @@ from tabs.tab_history import HistoryTab
 from tabs.tab_standards import StandardsTab
 from tabs.tab_dashboard import DashboardTab
 from tabs.tab_theme_config import ThemeConfigTab, DEFAULT_LIGHT_COLORS
-from tabs.tab_sync import SyncTab
 from PySide6.QtWidgets import QDialog, QVBoxLayout as _QVBox
 from sync.app_config import load_config
 
-_TRANSIENT_SYNC_KEYWORDS = (
-    "permissionerror", "locked", "cannot access", "winerror",
-    "timed out", "timeout", "network", "connection reset",
-    "remote end closed", "odmpath",
-)
 
-
-def _is_transient_sync_error(msg: str) -> bool:
-    m = msg.lower()
-    return any(k in m for k in _TRANSIENT_SYNC_KEYWORDS)
-
-
-class _SilentSyncThread(QThread):
-    """Run export_to_sharepoint silently in background after each case save.
-    Retries up to 3 times on transient network/file errors."""
-    done = Signal(bool, str)
-
-    def run(self):
-        try:
-            from sync.sharepoint_sync import export_to_sharepoint, _OPENPYXL_OK
-            from sync.app_config import load_config
-            if not _OPENPYXL_OK:
-                return
-            cfg = load_config()
-            if not cfg.get("name_confirmed") or not cfg.get("export_folder"):
-                return
-            import os as _os
-            if not _os.path.isdir(cfg["export_folder"]):
-                return
-            import time as _t
-            last_ok, last_msg = False, ""
-            for attempt in range(3):
-                try:
-                    ok, msg = export_to_sharepoint()
-                    if ok or not _is_transient_sync_error(msg) or attempt == 2:
-                        self.done.emit(ok, msg)
-                        return
-                    last_ok, last_msg = ok, msg
-                except Exception as e:
-                    last_ok, last_msg = False, str(e)
-                    if not _is_transient_sync_error(last_msg) or attempt == 2:
-                        self.done.emit(last_ok, last_msg)
-                        return
-                _t.sleep(5 * (attempt + 1))
-            self.done.emit(last_ok, last_msg)
-        except Exception as e:
-            self.done.emit(False, str(e))
 class CenteredTabWidget(QTabWidget):
     """QTabWidget whose tab bar is always horizontally centered.
 
@@ -420,11 +373,6 @@ class MainWindow(QMainWindow):
         self.history_tab = HistoryTab()
         self.standards_tab = StandardsTab()
         self.dashboard_tab = DashboardTab()
-        self._sync_dialog = None         # created lazily
-        self._sync_tab_widget = None     # SyncTab instance inside dialog
-        self._sync_thread = None         # background sync thread
-        self._sync_status_label = None   # statusbar indicator
-        self._eod_sync_triggered_date = None  # prevent double EOD trigger
 
         self._load_and_apply_light_palette()
 
@@ -523,17 +471,10 @@ class MainWindow(QMainWindow):
             _QTimer.singleShot(80,  self.production_tab.load_data)
             _QTimer.singleShot(160, self.history_tab.load_all_cases)
             _QTimer.singleShot(240, self.dashboard_tab.refresh)
-            _QTimer.singleShot(320, self._silent_sync)
         self.register_tab.ot_saved.connect(_deferred_refresh_after_ot_save)
-        
+
         # Connect standards tab to refresh app data when standards change
         self.standards_tab.standards_updated.connect(self.on_standards_updated)
-
-        # Auto-sync silently after every case save (queued so the UI yields
-        # before the sync thread spawns).
-        self.register_tab.case_saved.connect(
-            self._silent_sync, Qt.ConnectionType.QueuedConnection
-        )
 
         self._justification_blocking = False
         if _PERF_OK and _JUSTIFICATION_ENABLED:
@@ -544,9 +485,6 @@ class MainWindow(QMainWindow):
         self._break_reminder_shown = set()  # (fecha, break_id) already asked today
         self._start_break_reminder_timer()
 
-        # EOD auto-sync at 4:55 PM on weekdays
-        self._start_eod_sync_timer()
-        
         # Fallback qtawesome icons used only by the theme-toggle handler when it
         # needs to recolor icons in legacy paths. The sidebar nav uses native
         # FluentIcon (FIF) which auto-themes light/dark — see _fluent_tab_icons.
@@ -829,41 +767,8 @@ class MainWindow(QMainWindow):
             font_layout.addWidget(btn_fup)
             self._sb_widgets["font_group"] = font_group
             self.statusBar().addPermanentWidget(font_group)
-
-            # Sync — primary blue pill with cloud-upload icon + label.
-            _sync_src = _TI("tabler_cloud_upload.svg")
-            btn_sync = _QPB(" Sync")
-            btn_sync.setIcon(_sync_src.icon(color=_QColor("#FFFFFF")))
-            btn_sync.setIconSize(QSize(14, 14))
-            btn_sync.setToolTip("Export to SharePoint")
-            btn_sync.clicked.connect(self._open_sync_dialog)
-
-            def _apply_sync_btn(is_light: bool, _b=btn_sync, _src=_sync_src):
-                try:
-                    from tabs.theme_palette import palette
-                    p = palette(is_light)
-                except Exception:
-                    p = {"accent": "#1F6FEB"}
-                _b.setStyleSheet(
-                    f"QPushButton {{ background: {p['accent']};"
-                    f"  color: #FFFFFF; border: none; border-radius: 6px;"
-                    f"  padding: 4px 14px; font-weight: 700; font-size: 11px; }}"
-                    f"QPushButton:hover {{ background: {p['accent']}; }}"
-                )
-                _b.setIcon(_src.icon(color=_QColor("#FFFFFF")))
-            btn_sync.apply_palette = _apply_sync_btn
-            _apply_sync_btn(False)
-            self._sb_widgets["sync"] = btn_sync
-            self.statusBar().addPermanentWidget(btn_sync)
-
-            # Sync status indicator — multi-state pill (live / syncing /
-            # pending / failed). Replaces the plain QLabel.
-            from tabs.sync_status_pill import SyncStatusPill
-            self._sync_status_label = SyncStatusPill(self)
-            self._sb_widgets["sync_status"] = self._sync_status_label
-            self.statusBar().addWidget(self._sync_status_label)
         except Exception as exc:
-            log_event("main", f"statusbar theme/sync controls setup failed: {exc}", level="WARN")
+            log_event("main", f"statusbar theme controls setup failed: {exc}", level="WARN")
 
         # Apply initial style — scales QSS to persisted font_size and sizes
         # status-bar widgets correctly on first show.
@@ -888,227 +793,6 @@ class MainWindow(QMainWindow):
                 self.register_tab.load_daily_production()
             except Exception as exc:
                 log_event("main", f"refresh after UE target change failed: {exc}", level="WARN")
-
-    def _open_sync_dialog(self):
-        """Open the Sync panel as a Fluent modal anchored to MainWindow."""
-        try:
-            from qfluentwidgets import MessageBoxBase
-            from tabs.tabler_icons import TablerIcon
-            from PySide6.QtCore import (
-                QPropertyAnimation as _QPA, QEasingCurve as _QEC,
-                Property as _QProp, QSize as _QS,
-            )
-            from PySide6.QtGui import QColor as _QCol, QPainter as _QPn
-            from PySide6.QtWidgets import (
-                QFrame as _QF, QToolButton as _QTB, QWidget as _QW,
-            )
-
-            host = self
-            # Lazy-build the inner widget once; reuse across opens.
-            if self._sync_tab_widget is None:
-                self._sync_tab_widget = SyncTab()
-            sync_tab = self._sync_tab_widget
-
-            class _SyncModal(MessageBoxBase):
-                def __init__(_s, h):
-                    super().__init__(h.window() if h is not None else None)
-                    try:
-                        _s.setMaskColor(_QCol(0, 0, 0, 170))
-                    except Exception:
-                        pass
-                    _s.widget.setObjectName("syncCard")
-                    _s.widget.setStyleSheet(
-                        "#syncCard { background: #101824;"
-                        " border: 1px solid #21262D; border-radius: 14px; }"
-                    )
-                    _s.buttonGroup.setStyleSheet(
-                        "QFrame { background: #101824; border: none; }"
-                    )
-                    _s.viewLayout.setContentsMargins(0, 8, 0, 8)
-                    _s.viewLayout.setSpacing(0)
-
-                    # Header (cloud icon + title + close).
-                    def _div():
-                        d = _QF()
-                        d.setFixedHeight(1)
-                        d.setStyleSheet("background: #21262D; border: none;")
-                        return d
-
-                    header_wrap = _QW()
-                    hl = QVBoxLayout(header_wrap)
-                    hl.setContentsMargins(22, 12, 22, 12)
-                    hl.setSpacing(6)
-                    hdr = QHBoxLayout()
-                    hdr.setSpacing(10)
-                    # Use a QLabel + QPixmap so the icon keeps its original
-                    # colors (a disabled QToolButton would gray-tint it).
-                    from PySide6.QtGui import QPixmap as _QPx
-                    from tabs.widgets import _icon_url as _icu
-                    ic = QLabel()
-                    pix = _QPx(_icu("teams_sharepoint_logo.png"))
-                    if not pix.isNull():
-                        ic.setPixmap(pix.scaled(
-                            44, 44, Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation,
-                        ))
-                    ic.setFixedSize(48, 48)
-                    ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    ic.setStyleSheet(
-                        "background: transparent; border: none; padding: 0;"
-                    )
-                    tc = QVBoxLayout(); tc.setSpacing(2)
-                    t = QLabel("SharePoint Sync")
-                    t.setStyleSheet(
-                        "color: #E6EDF3; font-size: 15px; font-weight: 700;"
-                        " background: transparent;"
-                    )
-                    sub = QLabel("Push local data to the team SharePoint workbook.")
-                    sub.setWordWrap(True)
-                    sub.setStyleSheet(
-                        "color: #8B949E; font-size: 11px; background: transparent;"
-                    )
-                    tc.addWidget(t); tc.addWidget(sub)
-
-                    class _SpinX(_QTB):
-                        def __init__(s, *a, **kw):
-                            super().__init__(*a, **kw)
-                            s._rot = 0.0
-                            s._anim = _QPA(s, b"rotation", s)
-                            s._anim.setDuration(260)
-                            s._anim.setEasingCurve(_QEC.OutCubic)
-                        def get_rot(s): return s._rot
-                        def set_rot(s, v):
-                            s._rot = float(v); s.update()
-                        rotation = _QProp(float, get_rot, set_rot)
-                        def paintEvent(s, e):
-                            p = _QPn(s); p.setRenderHint(_QPn.Antialiasing)
-                            p.save()
-                            p.translate(s.width()/2, s.height()/2)
-                            p.rotate(s._rot)
-                            p.translate(-s.width()/2, -s.height()/2)
-                            s.icon().paint(p, 6, 6, s.width()-12, s.height()-12)
-                            p.restore()
-                        def enterEvent(s, e):
-                            s._anim.stop(); s._anim.setStartValue(s._rot)
-                            s._anim.setEndValue(90.0); s._anim.start()
-                            super().enterEvent(e)
-                        def leaveEvent(s, e):
-                            s._anim.stop(); s._anim.setStartValue(s._rot)
-                            s._anim.setEndValue(0.0); s._anim.start()
-                            super().leaveEvent(e)
-
-                    # "Last sync" chip on the right side of the header row.
-                    last_ts = ""
-                    try:
-                        last_ts = getattr(host._sync_status_label, "_timestamp", "") or ""
-                    except Exception:
-                        last_ts = ""
-                    chip = _QF()
-                    chip.setObjectName("syncLastChip")
-                    chip.setStyleSheet(
-                        "#syncLastChip { background: #0D1117;"
-                        " border: 1px solid #21262D; border-radius: 8px; }"
-                    )
-                    chip_lay = QHBoxLayout(chip)
-                    chip_lay.setContentsMargins(8, 4, 6, 4)
-                    chip_lay.setSpacing(6)
-                    dot = _QF()
-                    dot.setFixedSize(10, 10)
-                    dot.setStyleSheet(
-                        "background: #3FB950; border-radius: 5px;"
-                    )
-                    chip_lay.addWidget(dot, 0, Qt.AlignVCenter)
-                    chip_lbl = QLabel(
-                        f"Last sync: {last_ts}" if last_ts else "Last sync: —"
-                    )
-                    chip_lbl.setStyleSheet(
-                        "color: #C9D1D9; font-size: 11px; font-weight: 600;"
-                        " background: transparent;"
-                    )
-                    chip_lay.addWidget(chip_lbl, 0, Qt.AlignVCenter)
-                    chip_chev = _QTB()
-                    chip_chev.setFixedSize(18, 18)
-                    chip_chev.setIconSize(_QS(12, 12))
-                    chip_chev.setStyleSheet(
-                        "QToolButton { background: transparent; border: none; }"
-                    )
-                    try:
-                        chip_chev.setIcon(
-                            TablerIcon("tabler_chevron_down.svg").icon(color=_QCol("#8B949E"))
-                        )
-                    except Exception:
-                        pass
-                    chip_chev.setEnabled(False)
-                    chip_lay.addWidget(chip_chev, 0, Qt.AlignVCenter)
-
-                    cb = _SpinX()
-                    cb.setIcon(TablerIcon("tabler_x.svg").icon(color=_QCol("#8B949E")))
-                    cb.setIconSize(_QS(22, 22))
-                    cb.setCursor(Qt.PointingHandCursor)
-                    cb.setFixedSize(34, 34)
-                    cb.setStyleSheet(
-                        "QToolButton { background: transparent; border: none;"
-                        "  border-radius: 17px; }"
-                        "QToolButton:hover { background: rgba(255,255,255,0.08); }"
-                    )
-                    cb.clicked.connect(_s.reject)
-
-                    hdr.addWidget(ic, 0, Qt.AlignTop)
-                    hdr.addLayout(tc, 1)
-                    hdr.addWidget(chip, 0, Qt.AlignVCenter)
-                    hdr.addWidget(cb, 0, Qt.AlignTop)
-                    hl.addLayout(hdr)
-                    _s.viewLayout.addWidget(header_wrap)
-                    _s.viewLayout.addWidget(_div())
-
-                    # Body — host the actual SyncTab widget.
-                    body = _QW()
-                    bl = QVBoxLayout(body)
-                    bl.setContentsMargins(0, 0, 0, 0)
-                    bl.setSpacing(0)
-                    # Reparent so we can re-use it across opens.
-                    sync_tab.setParent(body)
-                    bl.addWidget(sync_tab)
-                    _s.viewLayout.addWidget(body, 1)
-                    _s.viewLayout.addWidget(_div())
-
-                    _s.widget.setMinimumWidth(820)
-                    _s.widget.setMinimumHeight(720)
-
-                    # Single Close button in the footer.
-                    _s.buttonLayout.removeWidget(_s.yesButton)
-                    _s.buttonLayout.removeWidget(_s.cancelButton)
-                    _s.yesButton.hide()
-                    _s.buttonLayout.addStretch(1)
-                    _s.cancelButton.setText("Close")
-                    _s.cancelButton.setFixedWidth(120)
-                    _s.cancelButton.setStyleSheet(
-                        "QPushButton { background: transparent; border: 1px solid #30363D;"
-                        "  color: #E6EDF3; border-radius: 6px; padding: 8px 22px;"
-                        "  font-weight: 700; font-size: 12px; }"
-                        "QPushButton:hover { background: rgba(255,255,255,0.05);"
-                        "  border-color: #58606A; }"
-                    )
-                    _s.buttonLayout.addWidget(_s.cancelButton, 0, Qt.AlignVCenter)
-
-            _SyncModal(host).exec()
-            return
-        except Exception as exc:
-            log_event("main", f"sync fluent modal failed, falling back: {exc}", level="WARN")
-
-        # Fallback — original floating QDialog implementation.
-        if self._sync_dialog is None:
-            self._sync_dialog = QDialog(self)
-            self._sync_dialog.setWindowTitle("SharePoint Sync")
-            self._sync_dialog.setMinimumSize(760, 800)
-            self._sync_dialog.resize(820, 820)
-            layout = QVBoxLayout(self._sync_dialog)
-            layout.setContentsMargins(0, 0, 0, 0)
-            self._sync_tab_widget = SyncTab()
-            layout.addWidget(self._sync_tab_widget)
-        self._sync_dialog.show()
-        self._sync_dialog.raise_()
-        self._sync_dialog.activateWindow()
 
     def _open_theme_config_dialog(self):
         # Prefer the Fluent-styled wrapper; fall back to the inline panel
@@ -1319,30 +1003,6 @@ class MainWindow(QMainWindow):
 
         return bool(_Sheet(host).exec())
 
-    # ── EOD auto-sync ─────────────────────────────────────────────────────────
-
-    def _start_eod_sync_timer(self):
-        self._eod_sync_timer = QTimer(self)
-        self._eod_sync_timer.setInterval(60_000)
-        self._eod_sync_timer.timeout.connect(self._check_eod_sync)
-        self._eod_sync_timer.start()
-
-    def _check_eod_sync(self):
-        today = date.today()
-        if today.weekday() >= 5:
-            return
-        now = datetime.now()
-        if not (now.hour == 16 and now.minute == 55):
-            return
-        if self._eod_sync_triggered_date == today:
-            return
-        self._eod_sync_triggered_date = today
-        log_event("main", "EOD auto-sync triggered at 16:55")
-        self._silent_sync()
-        if self._sync_status_label:
-            self._sync_status_label.setText("↻ EOD sync…")
-            self._sync_status_label.setStyleSheet(self._sync_label_style("#aaa"))
-
     # ── Daily performance / justification logic ───────────────────────────────
 
     @staticmethod
@@ -1457,24 +1117,6 @@ class MainWindow(QMainWindow):
                             event.ignore()
                             self._show_justification_popup(today_str, metrics)
                             return
-        # Warn if a manual sync operation (Sync dialog) is in progress.
-        sync_dialog_busy = (
-            self._sync_tab_widget is not None
-            and self._sync_tab_widget.is_busy()
-        )
-        if sync_dialog_busy:
-            reply = QMessageBox.question(
-                self, "Sync In Progress",
-                "A SharePoint sync operation is currently running.\n\n"
-                "Closing now may leave the upload incomplete.\n\n"
-                "Close anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-
         # Stop child timers explicitly so they can't fire after Qt cleanup.
         try:
             dm = getattr(self.register_tab, "downtime_manager", None)
@@ -1525,85 +1167,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             log_event("main", f"first-use setup failed: {exc}", level="WARN")
 
-    def _silent_sync(self):
-        """Debounced background sync to SharePoint.
-
-        Save Case is often clicked rapid-fire (5 cases in 30 s). Each save
-        used to trigger a full SharePoint round-trip, saturating I/O and
-        competing with OneDrive's own sync of the local DB. We now coalesce
-        bursts of saves into one sync per ``_SYNC_DEBOUNCE_MS`` window."""
-        from PySide6.QtCore import QTimer as _QTimer
-
-        # Skip immediately if a sync is already in flight — its completion
-        # already covers the latest writes.
-        if self._sync_thread and self._sync_thread.isRunning():
-            return
-
-        debouncer = getattr(self, "_sync_debouncer", None)
-        if debouncer is None:
-            debouncer = _QTimer(self)
-            debouncer.setSingleShot(True)
-            debouncer.timeout.connect(self._do_silent_sync)
-            self._sync_debouncer = debouncer
-        debouncer.start(8_000)  # 8 s window — coalesces rapid saves
-
-        if self._sync_status_label:
-            self._sync_status_label.setText("↻ pending…")
-            self._sync_status_label.setStyleSheet(self._sync_label_style("#aaa"))
-
-    def _do_silent_sync(self):
-        """Actually fire the background sync thread (called after debounce)."""
-        if self._sync_thread and self._sync_thread.isRunning():
-            return
-        self._sync_thread = _SilentSyncThread()
-        self._sync_thread.done.connect(self._on_silent_sync_done)
-        self._sync_thread.start()
-        if self._sync_status_label:
-            self._sync_status_label.setText("↻ syncing…")
-            self._sync_status_label.setStyleSheet(self._sync_label_style("#aaa"))
-
-    def _on_silent_sync_done(self, ok: bool, msg: str):
-        if not self._sync_status_label:
-            return
-        from datetime import datetime
-        ts = datetime.now().strftime("%H:%M")
-        if ok:
-            self._sync_status_label.setText(f"⬆ {ts}")
-            self._sync_status_label.setStyleSheet(self._sync_label_style("#66bb6a"))
-            # Clear the hover tooltip — the detail popover (chevron toggle)
-            # is the canonical way to see what was synced.
-            self._sync_status_label.setToolTip("")
-            self._sync_status_label.setCursor(Qt.CursorShape.ArrowCursor)
-            # Populate detail popover (parsed best-effort from msg).
-            if hasattr(self._sync_status_label, "set_details"):
-                import re as _re
-                files = _re.findall(r"([A-Za-z0-9_\-]+\.xlsx)", msg or "")
-                details = {"last_sync": ts}
-                if len(files) >= 1: details["report_file"] = files[0]
-                if len(files) >= 2: details["summary_file"] = files[1]
-                if len(files) >= 3: details["dashboard_file"] = files[2]
-                details["destination"] = "OneDrive synced to SharePoint"
-                self._sync_status_label.set_details(details)
-        else:
-            self._sync_status_label.setText(f"\u26a0 sync error")
-            self._sync_status_label.setStyleSheet(
-                self._sync_label_style("#ef9a9a", "text-decoration: underline; cursor: pointer;")
-            )
-            self._sync_status_label.setToolTip("")
-            self._sync_status_label.setCursor(Qt.CursorShape.PointingHandCursor)
-            # Store msg so mousePressEvent can show it
-            self._sync_status_label.setProperty("sync_error", msg)
-            if hasattr(self._sync_status_label, "set_details"):
-                self._sync_status_label.set_details({
-                    "last_sync": ts,
-                    "error": msg,
-                })
-            # Connect click only once
-            try:
-                self._sync_status_label.mousePressEvent = lambda e, m=msg: QMessageBox.warning(
-                    self, "Sync Error", m)
-            except Exception as exc:
-                log_event("main", f"sync error click handler setup failed: {exc}", level="WARN")
     def on_standards_updated(self):
         """Reload standards and units_eq in Register and Production tabs when standards are modified."""
         load_units_eq_data(force=True)  # Invalidate shared cache so all tabs pick up new values
@@ -1694,7 +1257,6 @@ class MainWindow(QMainWindow):
         h = 32
         w_side = 36
         w_af = 38
-        w_sync = 70
         ratio = 1.0
 
         # statusBar bg matches the sidebar (which inherits the app base), with
@@ -1789,29 +1351,6 @@ class MainWindow(QMainWindow):
             theme_divider.setStyleSheet(
                 f"background: {divider}; border: none;"
             )
-
-        btn_sync = self._sb_widgets.get("sync")
-        if btn_sync is not None:
-            btn_sync.setFixedSize(w_sync, h)
-            btn_sync.setIconSize(QSize(round(h * 0.56), round(h * 0.56)))
-            btn_sync.setStyleSheet(
-                "QPushButton { "
-                f"  background-color: #1757D4; color: #FFFFFF; "
-                f"  border: 1px solid #1757D4; border-radius: 8px; "
-                f"  font-size: {sb}px; font-weight: 600; padding: 1px 10px 1px 6px;"
-                " }"
-                "QPushButton:hover { background-color: #388BFD; border-color: #388BFD; }"
-                "QPushButton:pressed { background-color: #1158C7; }"
-            )
-
-        lbl = self._sb_widgets.get("sync_status")
-        if lbl is not None:
-            existing = lbl.styleSheet() or ""
-            color = "#8B949E"
-            m = re.search(r"color:\s*([^;]+);", existing)
-            if m:
-                color = m.group(1).strip()
-            lbl.setStyleSheet(f"font-size: {sb}px; color: {color}; padding-right: 4px;")
 
     def _apply_light_palette(self, colors: dict):
         mapping = {
@@ -1985,16 +1524,6 @@ class MainWindow(QMainWindow):
             save_config(cfg)
         except Exception as exc:
             log_event("main", f"font_size persist failed: {exc}", level="WARN")
-
-    def _sb_label_px(self) -> int:
-        """Pixel font size for status-bar small labels, scaled to active size."""
-        return max(8, round(10 * (self._font_size / 12.0)))
-
-    def _sync_label_style(self, color: str, extra: str = "") -> str:
-        return (
-            f"font-size: {self._sb_label_px()}px; color: {color}; "
-            f"padding-right: 4px; {extra}"
-        )
 
     # ── Clipboard import shortcut ─────────────────────────────────────────────
 
@@ -2746,19 +2275,6 @@ if __name__ == "__main__":
     window = MainWindow(dark_style=DARK_STYLE, light_style=LIGHT_STYLE)
     window.show()
     QTimer.singleShot(400, window._check_first_use)
-
-    # Cleanup old Excel exports in background (runs once per day, never touches DB)
-    def _run_cleanup():
-        import threading
-        def _bg():
-            try:
-                from sync.cleanup import run_cleanup
-                run_cleanup()
-            except Exception as exc:
-                print(f"[main] Cleanup error: {exc}")
-                log_event("main", f"cleanup error: {exc}", level="WARN")
-        threading.Thread(target=_bg, daemon=True).start()
-    QTimer.singleShot(3000, _run_cleanup)
 
     # Startup safety backup (lightweight, background, non-blocking)
     def _run_startup_backup():

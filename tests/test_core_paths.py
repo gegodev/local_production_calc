@@ -4,7 +4,6 @@ Tests for critical paths that had zero coverage:
   - sync.app_logger.log_event
   - db.database._db_has_data / get_connection
   - sync.safety_backup.run_startup_backups
-  - sync.cleanup.run_cleanup / _should_run / _mark_done
 """
 import os
 import shutil
@@ -164,7 +163,6 @@ def test_run_startup_backups_creates_db_backup(monkeypatch, tmp_path):
 
     monkeypatch.setattr(sb, "DB_PATH", str(fake_db))
     monkeypatch.setattr(sb, "get_local_app_dir", _fake_local)
-    monkeypatch.setattr(sb, "load_config", lambda: {"export_folder": ""})
 
     counters = sb.run_startup_backups()
     assert counters["db"] == 1
@@ -190,61 +188,3 @@ def test_prune_keeps_only_last_n(tmp_path):
 
     remaining = list(folder.iterdir())
     assert len(remaining) == 5
-
-
-# ── sync.cleanup ─────────────────────────────────────────────────────────────
-
-def test_cleanup_skips_if_no_export_folder(monkeypatch):
-    import sync.cleanup as cl
-    monkeypatch.setattr(cl, "load_config", lambda: {"export_folder": ""})
-    result = cl.run_cleanup()
-    assert result == ""
-
-
-def test_cleanup_runs_and_marks_done(monkeypatch, tmp_path):
-    import sync.cleanup as cl
-    from datetime import datetime, timedelta
-
-    export = tmp_path / "export"
-    productions = export / "Productions"
-    # Create old file structure
-    old_date = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
-    old_month = old_date[:7]
-    old_week = "Week-01"
-    old_dir = productions / old_month / old_week / old_date
-    old_dir.mkdir(parents=True)
-    (old_dir / "Designer_Production_test.xlsx").write_bytes(b"fake")
-
-    monkeypatch.setattr(cl, "load_config", lambda: {
-        "export_folder": str(export),
-        "designer_name": "TestUser",
-    })
-
-    result = cl.run_cleanup()
-    assert "Removed" in result
-    assert not (old_dir / "Designer_Production_test.xlsx").exists()
-
-
-def test_cleanup_runs_only_once_per_day(monkeypatch, tmp_path):
-    import sync.cleanup as cl
-
-    export = tmp_path / "export"
-    export.mkdir()
-    monkeypatch.setattr(cl, "load_config", lambda: {
-        "export_folder": str(export),
-        "designer_name": "TestUser",
-    })
-
-    # First run — nothing to delete, but should mark done
-    cl.run_cleanup()
-
-    # Second run same day — should skip
-    call_count = {"n": 0}
-    original = cl._cleanup_daily_productions
-    def _counting(*a, **kw):
-        call_count["n"] += 1
-        return original(*a, **kw)
-    monkeypatch.setattr(cl, "_cleanup_daily_productions", _counting)
-
-    cl.run_cleanup()
-    assert call_count["n"] == 0  # skipped because already ran today

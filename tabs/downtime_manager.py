@@ -1,5 +1,4 @@
 import os
-import threading
 import uuid
 
 from PySide6.QtWidgets import (
@@ -19,12 +18,6 @@ from .theme_palette import apply_fluent_modal_palette
 from sync.app_config import load_config
 from sync.app_logger import log_event
 from datetime import datetime
-try:
-    from sync.downtime_approval import export_pending_downtimes
-    _APPROVAL_OK = True
-except Exception as _approval_err:
-    print(f"[downtime_manager] Approval module unavailable: {_approval_err}")
-    _APPROVAL_OK = False
 
 # Local mirror of the pending-status string.
 STATUS_PENDING_LOCAL = "pending"
@@ -48,67 +41,6 @@ DOWNTIME_REASONS: list[str] = [
 ]
 
 
-# ── Sync-state helpers ───────────────────────────────────────────────────────
-# Flip the per-row sync flags when a destination confirms receipt. Idempotent —
-# safe to call from any thread, but keep them tiny (single UPDATE) so the lock
-# window stays small under WAL.
-
-def _mark_excel_synced(dt_id: int) -> None:
-    if not dt_id:
-        return
-    try:
-        conn = get_connection()
-        conn.execute(
-            "UPDATE downtimes SET synced_to_excel = 1, last_sync_error = '' "
-            "WHERE id = ?",
-            (int(dt_id),),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as exc:
-        log_event("downtime_manager",
-                  f"_mark_excel_synced({dt_id}) failed: {exc}",
-                  level="WARN")
-
-
-def _mark_teams_synced(dt_id: int) -> None:
-    if not dt_id:
-        return
-    try:
-        conn = get_connection()
-        conn.execute(
-            "UPDATE downtimes SET synced_to_teams = 1 WHERE id = ?",
-            (int(dt_id),),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as exc:
-        log_event("downtime_manager",
-                  f"_mark_teams_synced({dt_id}) failed: {exc}",
-                  level="WARN")
-
-
-def _bump_sync_attempt(dt_id: int, err_msg: str = "") -> None:
-    """Increment sync_attempts and stash the last error for diagnostics."""
-    if not dt_id:
-        return
-    try:
-        conn = get_connection()
-        conn.execute(
-            "UPDATE downtimes "
-            "SET sync_attempts = COALESCE(sync_attempts, 0) + 1, "
-            "    last_sync_error = ? "
-            "WHERE id = ?",
-            (str(err_msg)[:500], int(dt_id)),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as exc:
-        log_event("downtime_manager",
-                  f"_bump_sync_attempt({dt_id}) failed: {exc}",
-                  level="WARN")
-
-
 class DowntimeManager(QWidget):
     def __init__(self, parent=None, on_update_callback=None):
         super().__init__(parent)
@@ -116,11 +48,9 @@ class DowntimeManager(QWidget):
         self.delete_mode = False
         self.edit_mode = False
         self.current_date = datetime.now().strftime("%Y-%m-%d")
-        self._retry_in_progress = False
         self.init_ui()
         self.load_downtimes()
         self._start_refresh_timer()
-        self._start_retry_timer()
 
     def _start_refresh_timer(self):
         """Refresh the downtime table every 15 s so status changes made on
@@ -157,109 +87,8 @@ class DowntimeManager(QWidget):
                 pass
             self._refresh_timer = None
 
-    # ── Retry worker for unsynced downtimes ─────────────────────────────────
-    # Every 60 s, scan for rows where synced_to_excel=0 and re-trigger the
-    # Excel export. Silent — the user only notices via the per-row status
-    # icon. The Teams webhook flow is retired; this worker only targets the
-    # shared per-designer xlsx.
-    def _start_retry_timer(self):
-        if not _APPROVAL_OK:
-            return
-        self._retry_timer = QTimer(self)
-        self._retry_timer.setInterval(60_000)  # 60 seconds
-        self._retry_timer.timeout.connect(self._retry_unsynced_downtimes)
-        self._retry_timer.start()
-        self.destroyed.connect(self._stop_retry_timer)
-        # Kick once shortly after startup to clear any backlog from prior session
-        QTimer.singleShot(5_000, self._retry_unsynced_downtimes)
-
-    def _stop_retry_timer(self, *_args):
-        timer = getattr(self, "_retry_timer", None)
-        if timer is not None:
-            try:
-                timer.stop()
-            except Exception:
-                pass
-            self._retry_timer = None
-
-    def _retry_unsynced_downtimes(self):
-        """Find pending unsynced downtimes and retry their failed destinations.
-
-        Runs in a background thread so the UI never blocks. Reentrancy-guarded
-        with `_retry_in_progress` so back-to-back ticks don't pile up.
-        """
-        if self._retry_in_progress:
-            return
-        self._retry_in_progress = True
-
-        def _run():
-            try:
-                self._do_retry_unsynced()
-            except Exception as exc:
-                log_event("downtime_manager",
-                          f"retry worker crashed: {exc}",
-                          level="WARN")
-            finally:
-                self._retry_in_progress = False
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _do_retry_unsynced(self):
-        """Retry the Excel export when needed.
-
-        Triggers an export when EITHER:
-          - some row has synced_to_excel=0 (insert/edit/status-change failed
-            to propagate), OR
-          - it has been more than _FORCE_RESYNC_SECONDS since the last export
-            (catches deletions that failed to propagate, since a deleted row
-            leaves no flag behind to retry from).
-        """
-        if not _APPROVAL_OK:
-            return
-        try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT 1 FROM downtimes WHERE synced_to_excel = 0 LIMIT 1"
-            )
-            has_unsynced = cur.fetchone() is not None
-            conn.close()
-        except Exception as exc:
-            print(f"[downtime_manager] retry: query failed: {exc}")
-            return
-
-        import time as _time
-        now = _time.time()
-        last = getattr(self, "_last_force_resync_ts", 0.0)
-        force_due = (now - last) >= self._FORCE_RESYNC_SECONDS
-
-        if not has_unsynced and not force_due:
-            return
-
-        cfg = load_config()
-        designer = cfg.get("designer_name", "")
-        try:
-            ok = export_pending_downtimes(designer)
-            if ok:
-                self._last_force_resync_ts = now
-            else:
-                log_event("downtime_manager",
-                          "retry export returned False", level="WARN")
-        except Exception as exc:
-            log_event("downtime_manager",
-                      f"retry export crashed: {exc}", level="WARN")
-            return
-
-        try:
-            QTimer.singleShot(0, self.load_downtimes)
-        except Exception:
-            pass
-
-    _FORCE_RESYNC_SECONDS = 300  # 5-minute periodic full resync as a safety net
-
     def closeEvent(self, event):
         self._stop_refresh_timer()
-        self._stop_retry_timer()
         super().closeEvent(event)
 
     def set_date(self, date_str: str):
@@ -628,24 +457,6 @@ class DowntimeManager(QWidget):
         self.load_downtimes()
         self.downtime_start.setTime(QTime.currentTime())
         self.downtime_end.setTime(QTime.currentTime())
-
-        # Kick off the Excel export in the background. The retry worker keeps
-        # trying every 60 s until synced_to_excel flips to 1, so a transient
-        # OneDrive lock here is NOT data loss.
-        if _APPROVAL_OK:
-            cfg = load_config()
-            designer = cfg.get("designer_name", "")
-            def _bg_first_sync():
-                try:
-                    ok = export_pending_downtimes(designer)
-                    if not ok:
-                        _bump_sync_attempt(dt_id, "first export returned False")
-                except Exception as exc:
-                    log_event("downtime_manager",
-                              f"first sync failed for DT #{dt_id}: {exc}",
-                              level="WARN")
-                    _bump_sync_attempt(dt_id, str(exc))
-            threading.Thread(target=_bg_first_sync, daemon=True).start()
 
         if self.on_update_callback:
             self.on_update_callback()
@@ -1492,14 +1303,6 @@ class DowntimeManager(QWidget):
         if self.on_update_callback:
             self.on_update_callback()
 
-        # Push the new status to the shared Excel in the background
-        if _APPROVAL_OK:
-            designer = self._current_designer_name()
-            threading.Thread(
-                target=lambda: export_pending_downtimes(designer),
-                daemon=True,
-            ).start()
-
     def _current_designer_name(self) -> str:
         try:
             cfg = load_config()
@@ -1800,11 +1603,6 @@ class DowntimeManager(QWidget):
             return
 
         self.load_downtimes()
-        if _APPROVAL_OK:
-            cfg = load_config()
-            _designer = cfg.get("designer_name", "")
-            threading.Thread(target=export_pending_downtimes,
-                             args=(_designer,), daemon=True).start()
         if self.on_update_callback:
             self.on_update_callback()
 
@@ -1859,18 +1657,6 @@ class DowntimeManager(QWidget):
 
         if self.on_update_callback:
             self.on_update_callback()
-
-        # Re-export this designer's xlsx so the deletion propagates to the
-        # shared folder. export_pending_downtimes reads the full local table
-        # and rewrites _DT_<designer>.xlsx from scratch, so a deleted row
-        # simply disappears. The consolidated file picks the change up on
-        # its next rebuild (also kicked off by export_pending_downtimes).
-        if _APPROVAL_OK:
-            designer = self._current_designer_name()
-            threading.Thread(
-                target=lambda: export_pending_downtimes(designer),
-                daemon=True,
-            ).start()
 
     def delete_downtime(self):
         """Toggle delete-pick mode. While active, the table is highlighted
