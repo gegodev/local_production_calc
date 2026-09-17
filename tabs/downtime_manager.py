@@ -596,20 +596,35 @@ class DowntimeManager(QWidget):
         client_uid = str(uuid.uuid4())
         # synced_to_teams is repurposed as "manually marked by user" (always 1
         # to keep the retry worker out of the Teams loop, which no longer exists).
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO downtimes
-                (fecha, hora_inicio, hora_fin, razon, duracion, status, detalle,
-                 client_uid, synced_to_excel, synced_to_teams)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1)
-        """, (
-            self.current_date, start, end, reason, duration,
-            STATUS_PENDING_LOCAL, detalle, client_uid,
-        ))
-        dt_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+        #
+        # The DB lives on a OneDrive-synced folder, so the INSERT can hit a
+        # transient "database is locked" while OneDrive holds the file. That
+        # used to bubble out of this Qt slot unhandled and PySide6 would kill
+        # the whole process (the "freeze then close" users reported). Catch it,
+        # keep the app alive, and let the user retry — the entry is not lost.
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO downtimes
+                    (fecha, hora_inicio, hora_fin, razon, duracion, status, detalle,
+                     client_uid, synced_to_excel, synced_to_teams)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1)
+            """, (
+                self.current_date, start, end, reason, duration,
+                STATUS_PENDING_LOCAL, detalle, client_uid,
+            ))
+            dt_id = cursor.lastrowid
+            conn.commit()
+        except Exception as exc:
+            log_event("downtime_manager",
+                      f"add_downtime INSERT failed: {exc}", level="ERROR")
+            self._toast(
+                "Couldn't save the downtime — the shared file was busy "
+                "(OneDrive sync). Nothing was lost; try Add again in a moment.",
+                level="error",
+            )
+            return
         self.load_downtimes()
         self.downtime_start.setTime(QTime.currentTime())
         self.downtime_end.setTime(QTime.currentTime())

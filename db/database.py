@@ -11,34 +11,55 @@ def get_base_path():
     else:
         return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-def get_data_path():
-    """Resolve the canonical DB folder: %OneDrive%\\ProductionCalcApp\\
+def get_onedrive_dir():
+    """Return %OneDrive%\\ProductionCalcApp — the SYNCED folder.
 
-    OneDrive syncs this folder automatically, so the same cases.db is
-    accessible from every machine (work PC, home PC, .exe, dev script).
-
-    Fallback chain (in case OneDrive env var is missing):
-      1. %OneDrive%\\ProductionCalcApp
-      2. %USERPROFILE%\\OneDrive\\ProductionCalcApp
-      3. %APPDATA%\\ProductionCalcApp   (last resort, non-synced)
-
-    The folder is created if it doesn't exist, but the DB file itself is
-    NEVER deleted or overwritten — only opened/read/written by SQLite.
+    IMPORTANT: this no longer hosts the *live* cases.db. A live SQLite file on
+    OneDrive gets locked by OneDrive mid-sync, and SQLite then blocks the UI
+    thread up to busy_timeout (15 s) → the app shows "Not Responding" after
+    every write. OneDrive is now used only for the DURABLE BACKUP copy so data
+    is never lost if a PC dies. See backup_db_to_onedrive().
     """
     onedrive = (
         os.environ.get("OneDrive")
         or os.path.join(os.environ.get("USERPROFILE", ""), "OneDrive")
     )
-    data_dir = os.path.join(onedrive, "ProductionCalcApp")
-    try:
-        os.makedirs(data_dir, exist_ok=True)
-    except OSError:
-        # Absolute fallback: use AppData if OneDrive is unavailable
-        data_dir = os.path.join(os.environ.get("APPDATA", get_base_path()), "ProductionCalcApp")
-        os.makedirs(data_dir, exist_ok=True)
-    return data_dir
+    return os.path.join(onedrive, "ProductionCalcApp")
 
-DB_PATH = os.path.join(get_data_path(), "cases.db")
+
+def get_live_db_dir():
+    """Return the LOCAL (non-synced) folder that holds the live cases.db.
+
+    Kept off OneDrive on purpose so OneDrive can never lock the file under
+    SQLite — that lock was the cause of the UI freezes. Durability is handled
+    separately by mirroring this file to OneDrive on a background thread.
+
+    Fallback chain:
+      1. %USERPROFILE%\\ProductionCalcApp   (local, normal case)
+      2. %LOCALAPPDATA%\\ProductionCalcApp  (if the first isn't writable)
+    """
+    base = os.path.join(
+        os.environ.get("USERPROFILE", os.path.expanduser("~")),
+        "ProductionCalcApp",
+    )
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        base = os.path.join(
+            os.environ.get("LOCALAPPDATA", get_base_path()), "ProductionCalcApp"
+        )
+        os.makedirs(base, exist_ok=True)
+    return base
+
+
+def get_data_path():
+    """Backwards-compatible alias — now points at the LOCAL live-DB folder."""
+    return get_live_db_dir()
+
+
+DB_PATH = os.path.join(get_live_db_dir(), "cases.db")
+# Durable mirror + fresh-install seed source on OneDrive.
+ONEDRIVE_DB_PATH = os.path.join(get_onedrive_dir(), "cases.db")
 
 # Current schema version - increment when making DB changes
 CURRENT_SCHEMA_VERSION = 4
@@ -58,6 +79,11 @@ def _get_legacy_db_candidates() -> list:
     local_app   = os.environ.get("LOCALAPPDATA", "")
     user_profile = os.environ.get("USERPROFILE", os.path.expanduser("~"))
     app_data    = os.environ.get("APPDATA", "")
+
+    # The former live-DB location: %OneDrive%\ProductionCalcApp\cases.db.
+    # Now that the live DB is local, this OneDrive copy is a legacy source we
+    # seed the local DB from on the first run of this version.
+    candidates.append(os.path.join(get_onedrive_dir(), "cases.db"))
 
     if local_app:
         candidates.append(os.path.join(local_app,   "ProductionCalcApp", "data", "cases.db"))
@@ -367,6 +393,60 @@ def discover_and_merge_background_dbs(max_seconds: int = 30) -> str:
         f"Auto-merge: {merged_sources} source(s), "
         f"+{total_cases} cases, +{total_ot} OT, +{total_dt} downtimes."
     )
+
+
+def backup_db_to_onedrive(keep_last: int = 10) -> bool:
+    """Mirror the live LOCAL cases.db to OneDrive so data survives a dead PC.
+
+    Writes two things under %OneDrive%\\ProductionCalcApp:
+      • cases.db            — stable mirror; also what a fresh install / new PC
+                              seeds from (it's a legacy candidate above).
+      • backups\\db\\cases_<ts>.db — timestamped snapshot, pruned to keep_last.
+
+    The app never holds a live handle on these OneDrive files, so OneDrive can
+    upload them without contending with SQLite — no UI freeze. Safe to call
+    from a background thread; never raises.
+    """
+    import shutil
+    from datetime import datetime as _dt
+    try:
+        if not os.path.isfile(DB_PATH):
+            return False
+        od_dir = get_onedrive_dir()
+        os.makedirs(od_dir, exist_ok=True)
+
+        # Stable mirror (seed for fresh installs / other machines).
+        try:
+            shutil.copy2(DB_PATH, ONEDRIVE_DB_PATH)
+        except Exception as exc:
+            # OneDrive may momentarily hold the mirror open for upload — that's
+            # fine, the next cycle retries. This is a backup, not the live file.
+            log_event("db", f"onedrive mirror copy failed: {exc}", level="WARN")
+            return False
+
+        # Timestamped snapshot + prune.
+        try:
+            bdir = os.path.join(od_dir, "backups", "db")
+            os.makedirs(bdir, exist_ok=True)
+            ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(DB_PATH, os.path.join(bdir, f"cases_{ts}.db"))
+            snaps = sorted(
+                (os.path.join(bdir, n) for n in os.listdir(bdir)
+                 if n.startswith("cases_") and n.endswith(".db")),
+                key=os.path.getmtime, reverse=True,
+            )
+            for old in snaps[keep_last:]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        except Exception as exc:
+            log_event("db", f"onedrive snapshot failed: {exc}", level="WARN")
+            # Stable mirror already succeeded, so still count as a success.
+        return True
+    except Exception as exc:
+        log_event("db", f"backup_db_to_onedrive failed: {exc}", level="WARN")
+        return False
 
 
 def _table_exists(cursor, table_name: str) -> bool:
@@ -712,9 +792,14 @@ def _ensure_wal_mode(conn: sqlite3.Connection) -> None:
     """
     global _WAL_INIT_DONE
     try:
-        conn.execute("PRAGMA journal_mode=DELETE")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        # busy_timeout is PER-CONNECTION — every thread's connection must set
+        # it or background workers fall back to the 5 s connect() default and
+        # throw "database is locked" far sooner under OneDrive contention.
         conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        # journal_mode only needs setting once for the file, but re-asserting
+        # it per connection is a cheap no-op.
+        conn.execute("PRAGMA journal_mode=DELETE")
         _WAL_INIT_DONE = True
     except Exception as _e:
         print(f"[db] journal mode init skipped: {_e}")
@@ -743,11 +828,13 @@ _CONN_TLS = threading.local()  # one cached connection per thread
 
 def _new_raw_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(
-        DB_PATH, timeout=5.0, check_same_thread=False,
+        DB_PATH, timeout=15.0, check_same_thread=False,
         factory=_CachedConnection,
     )
-    if not _WAL_INIT_DONE:
-        _ensure_wal_mode(conn)
+    # Apply per-connection pragmas on EVERY new connection (not just the first).
+    # busy_timeout is per-connection, so guarding this behind a global flag left
+    # every background-thread connection with only the 5 s connect() default.
+    _ensure_wal_mode(conn)
     return conn
 
 

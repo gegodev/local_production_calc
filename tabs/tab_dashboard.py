@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QBoxLayout, QStackedWidget, QButtonGroup,
     QDialog, QFileDialog, QMessageBox, QTabWidget,
 )
-from PySide6.QtCore import QDate, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QDate, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush
 
 from db.database import get_connection
@@ -1261,11 +1261,18 @@ class _DesignerDayDialog(_MBB):
 
 class DashboardTab(QWidget):
 
+    # Emitted from the background team-load thread with the loaded summaries
+    # (or None on failure). Delivered to _apply_team_data on the UI thread so
+    # widget population never happens off the main thread.
+    _team_data_ready = Signal(object)
+
     def __init__(self):
         super().__init__()
         self._standards: dict = {}
+        self._team_loading = False
         self._load_metadata()
         self._init_ui()
+        self._team_data_ready.connect(self._apply_team_data)
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -2193,6 +2200,24 @@ class DashboardTab(QWidget):
         h.addWidget(bar_wrap, 1, Qt.AlignmentFlag.AlignVCenter)
         return wrap
 
+    def _build_status_widget(self, text: str, color: str):
+        """Muted pill used in the Production % column for designers with no
+        activity today or whose file couldn't be read (sync pending). Keeps
+        every enrolled designer visible instead of dropping them."""
+        wrap = QWidget()
+        wrap.setStyleSheet("background: transparent;")
+        h = QHBoxLayout(wrap)
+        h.setContentsMargins(8, 0, 8, 0)
+        h.setSpacing(0)
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-style: italic;"
+            " background: transparent;"
+        )
+        lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(lbl, 1)
+        return wrap
+
     def _build_designer_cell(self, name: str):
         """Cell widget for the Designer column: avatar circle with
         first-name + last-name initials + the name itself."""
@@ -2251,19 +2276,41 @@ class DashboardTab(QWidget):
         return wrap
 
     def _refresh_team_view(self):
-        """Read the shared folder, repopulate KPIs + table. Silent on failure."""
-        from datetime import datetime
+        """Kick a BACKGROUND read of the shared folder. Reading 38 designers'
+        _Summary.xlsx off OneDrive is slow (placeholders, locks, retries) and
+        MUST NOT run on the UI thread — doing so froze the app ("Not
+        Responding"). The worker emits _team_data_ready; _apply_team_data then
+        repaints on the UI thread."""
+        import threading
+        if self._team_loading:
+            return  # a load is already in flight; don't pile up
         target_date = self.team_date_picker.date().toString("yyyy-MM-dd")
-        try:
-            rows = self._load_team_summaries(target_date)
-        except Exception as exc:
-            print(f"[Dashboard team] load failed: {exc}")
+        self._team_loading = True
+
+        def _work():
+            try:
+                rows = self._load_team_summaries(target_date)
+            except Exception as exc:
+                print(f"[Dashboard team] load failed: {exc}")
+                rows = None
+            try:
+                self._team_data_ready.emit(rows)
+            except RuntimeError:
+                pass  # widget destroyed mid-load — drop the result
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _apply_team_data(self, rows):
+        """UI-thread slot: repopulate KPIs + table from the background load."""
+        self._team_loading = False
+        if rows is None:
             self._team_last_load_ok = False
             self._update_freshness_label()
             return
 
         # KPIs
         enrolled = rows["enrolled_count"]
+        self._team_unread = rows.get("unread", [])
         active = sum(1 for r in rows["people"] if r["pct"] > 0 or r["cases"] > 0)
         active_rows = [r for r in rows["people"] if r["pct"] > 0 or r["cases"] > 0]
         avg_pct = (sum(r["pct"] for r in active_rows) / len(active_rows)) if active_rows else 0.0
@@ -2274,17 +2321,31 @@ class DashboardTab(QWidget):
         self.kpi_team_avg.set_value(f"{avg_pct:.1f}%")
         self.kpi_team_ue.set_value(f"{total_ue:.1f}")
 
-        # Table — only people with any activity today, sorted by % desc.
-        visible = sorted(active_rows, key=lambda r: r["pct"], reverse=True)
+        # Table — show EVERY enrolled designer. Order:
+        #   1) active today  → by production % desc (medals apply here)
+        #   2) read but idle  → alphabetical (no activity today)
+        #   3) sync pending   → alphabetical (file couldn't be read this pass)
+        def _state(r):
+            if r.get("unread"):
+                return 2
+            if r["pct"] > 0 or r["cases"] > 0:
+                return 0
+            return 1
+        visible = sorted(
+            rows["people"],
+            key=lambda r: (_state(r), -r["pct"], r["designer"].lower()),
+        )
         self.tbl_team.setRowCount(len(visible))
         self.tbl_team.verticalHeader().setDefaultSectionSize(40)
         for i, r in enumerate(visible):
+            st = _state(r)
             rank = i + 1
             it_rank = QTableWidgetItem(str(rank))
             it_rank.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            # Highlight top 3 with bold + medal-ish colours.
+            # Medals only for the top-3 ACTIVE designers — never for an idle
+            # or sync-pending row that happens to land in the first slots.
             rank_color = {1: "#E6B800", 2: "#C0C0C0", 3: "#CD7F32"}.get(rank)
-            if rank_color:
+            if rank_color and st == 0:
                 f = QFont(); f.setBold(True)
                 it_rank.setFont(f)
                 it_rank.setForeground(QBrush(QColor(rank_color)))
@@ -2292,8 +2353,13 @@ class DashboardTab(QWidget):
             # Empty item — Designer column rendered via cellWidget below.
             it_name = QTableWidgetItem("")
             it_name.setData(Qt.ItemDataRole.UserRole, r["designer"])
-            it_ue   = QTableWidgetItem(f"{r['ue']:.2f}")
-            it_cs   = QTableWidgetItem(str(r["cases"]))
+            # Idle/unread rows show a dash for UE + Cases (no data to show).
+            if st == 0:
+                ue_txt, cs_txt = f"{r['ue']:.2f}", str(r["cases"])
+            else:
+                ue_txt, cs_txt = "—", "—"
+            it_ue   = QTableWidgetItem(ue_txt)
+            it_cs   = QTableWidgetItem(cs_txt)
             it_ue.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             it_cs.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -2302,11 +2368,19 @@ class DashboardTab(QWidget):
             self.tbl_team.setCellWidget(
                 i, 1, self._build_designer_cell(r["designer"]),
             )
-            # Production % cell as a custom widget: horizontal progress
-            # bar + percentage label coloured by tier.
-            self.tbl_team.setCellWidget(
-                i, 2, self._build_pct_bar_widget(r["pct"]),
-            )
+            # Production % cell: real bar for active, muted status for the rest.
+            if st == 0:
+                self.tbl_team.setCellWidget(
+                    i, 2, self._build_pct_bar_widget(r["pct"]),
+                )
+            elif st == 2:
+                self.tbl_team.setCellWidget(
+                    i, 2, self._build_status_widget("Sync pending", "#F0883E"),
+                )
+            else:
+                self.tbl_team.setCellWidget(
+                    i, 2, self._build_status_widget("No activity today", "#6E7681"),
+                )
             self.tbl_team.setItem(i, 3, it_ue)
             self.tbl_team.setItem(i, 4, it_cs)
 
@@ -2330,6 +2404,19 @@ class DashboardTab(QWidget):
             text = f"Last update: {age // 3600}h ago"
         # Amber if older than 5 minutes (sync probably stalled)
         color = "#F0883E" if age > 300 else "#8B949E"
+        # Flag designers whose _Summary.xlsx couldn't be read this pass (OneDrive
+        # placeholder not downloaded, or file locked). They're NOT missing data —
+        # this machine just couldn't reach their file yet.
+        unread = getattr(self, "_team_unread", []) or []
+        if unread:
+            text += f"  ·  {len(unread)} sync pending"
+            color = "#F0883E"
+            self.team_freshness_label.setToolTip(
+                "Couldn't read these designers' files (OneDrive not synced / "
+                "file open elsewhere):\n  " + "\n  ".join(sorted(unread))
+            )
+        else:
+            self.team_freshness_label.setToolTip("")
         self.team_freshness_label.setText(text)
         self.team_freshness_label.setStyleSheet(f"color: {color}; font-size: 11px;")
 
@@ -2427,47 +2514,180 @@ class DashboardTab(QWidget):
                 full = os.path.join(productions_dir, entry)
                 if not os.path.isdir(full):
                     continue
-                summary = os.path.join(full, "_Summary.xlsx")
-                if os.path.isfile(summary):
-                    designer_dirs.append((entry, summary))
+                # A designer folder qualifies if it has EITHER the robust
+                # SQLite mirror or the legacy Excel summary.
+                if (os.path.isfile(os.path.join(full, "_summary.db")) or
+                        os.path.isfile(os.path.join(full, "_Summary.xlsx"))):
+                    designer_dirs.append((entry, full))
         except Exception as exc:
             print(f"[Dashboard team] scan dir failed: {exc}")
 
-        for designer_name, summary_path in designer_dirs:
+        unread = []  # designers whose summary could not be read this pass
+        for designer_name, full_dir in designer_dirs:
             display = designer_name.replace("_", " ")
-            pct, ue, cases = 0.0, 0.0, 0
-            try:
-                wb = openpyxl.load_workbook(summary_path, read_only=True, data_only=True)
-                ws = wb.active
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    if not row or row[0] != target_date:
-                        continue
-                    pct = self._parse_pct(row[4]) if len(row) > 4 else 0.0
-                    # Per-designer _Summary.xlsx columns (1-indexed):
-                    #   1 Date · 2 Week · 3 Cases% · 4 Downtime% · 5 Total%
-                    #   6 Reg Cases · 7 OT Cases · 8 UE (Total) · 9 UE (Cases)
-                    # We surface UE (Cases) — pure case UE without the
-                    # downtime credit — so the Team dashboard reflects
-                    # work output only.
-                    ue = float(row[8] or 0) if len(row) > 8 else (
-                        float(row[7] or 0) if len(row) > 7 else 0.0
-                    )
-                    reg_cases = int(row[5] or 0) if len(row) > 5 else 0
-                    ot_cases = int(row[6] or 0) if len(row) > 6 else 0
-                    cases = reg_cases + ot_cases
-                    break
-                wb.close()
-            except Exception as exc:
-                # File might be locked by Excel on the other machine; skip silently.
+            pct, ue, cases, ok = self._read_designer_summary(full_dir, target_date)
+            if not ok:
+                # Could NOT read any source (both the .db and .xlsx failed —
+                # OneDrive placeholder not hydrated / locked / transient IO).
+                # Keep the person visible flagged as unread instead of dropping
+                # them, so the UI shows "N sync pending" rather than vanishing.
+                unread.append(display)
+                people.append({
+                    "designer": display,
+                    "pct": 0.0, "ue": 0.0, "cases": 0,
+                    "unread": True,
+                })
                 continue
             people.append({
                 "designer": display,
                 "pct": pct,
                 "ue": ue,
                 "cases": cases,
+                "unread": False,
             })
 
-        return {"enrolled_count": len(designer_dirs), "people": people}
+        return {
+            "enrolled_count": len(designer_dirs),
+            "people": people,
+            "unread": unread,
+        }
+
+    def _read_designer_summary(self, full_dir: str, target_date: str):
+        """Resolve one designer's (pct, ue, cases, ok) for target_date.
+
+        Prefers the robust SQLite mirror (_summary.db); falls back to the legacy
+        _Summary.xlsx only if the .db is missing or unreadable. `ok` is False
+        only when NO source could be read at all — meaning the file genuinely
+        hasn't reached this machine yet (sync pending), not "no activity"."""
+        # 1) Preferred: SQLite mirror — copy-and-open, immune to locks.
+        db_path = os.path.join(full_dir, "_summary.db")
+        if os.path.isfile(db_path):
+            res = self._read_summary_db_row(db_path, target_date)
+            if res is not None:
+                return res  # read succeeded (row may be absent → zeros, ok=True)
+            # .db present but unreadable → try the Excel fallback below.
+
+        # 2) Fallback: legacy Excel summary.
+        xlsx_path = os.path.join(full_dir, "_Summary.xlsx")
+        if os.path.isfile(xlsx_path):
+            wb = self._open_summary_resilient(xlsx_path)
+            if wb is not None:
+                pct, ue, cases = 0.0, 0.0, 0
+                try:
+                    ws = wb.active
+                    for row in ws.iter_rows(min_row=2, values_only=True):
+                        if not row or row[0] != target_date:
+                            continue
+                        # Cols (1-indexed): 1 Date 2 Week 3 Cases% 4 DT% 5 Total%
+                        # 6 RegCases 7 OTCases 8 UE(Total) 9 UE(Cases).
+                        pct = self._parse_pct(row[4]) if len(row) > 4 else 0.0
+                        ue = float(row[8] or 0) if len(row) > 8 else (
+                            float(row[7] or 0) if len(row) > 7 else 0.0
+                        )
+                        reg_cases = int(row[5] or 0) if len(row) > 5 else 0
+                        ot_cases = int(row[6] or 0) if len(row) > 6 else 0
+                        cases = reg_cases + ot_cases
+                        break
+                except Exception as exc:
+                    print(f"[Dashboard team] xlsx parse failed for {full_dir}: {exc}")
+                finally:
+                    try:
+                        wb.close()
+                    except Exception:
+                        pass
+                return (pct, ue, cases, True)
+
+        return (0.0, 0.0, 0, False)  # nothing readable → sync pending
+
+    @staticmethod
+    def _read_summary_db_row(db_path: str, target_date: str):
+        """Read one designer's daily row from _summary.db.
+
+        Copies the file to temp first, so an in-progress OneDrive upload or a
+        lock never blocks the read. Returns (pct, ue, cases, True) — with zeros
+        if there's simply no row for target_date — or None if the file couldn't
+        be copied/opened at all (so the caller can fall back to Excel)."""
+        import sqlite3 as _sql
+        import shutil as _sh
+        import tempfile as _tf
+        tmp = None
+        try:
+            tmp = os.path.join(
+                _tf.gettempdir(),
+                f"_teamsumdb_{os.getpid()}_{abs(hash(db_path)) % 99999}.db",
+            )
+            _sh.copy2(db_path, tmp)
+            conn = _sql.connect(tmp)
+            try:
+                cur = conn.execute(
+                    "SELECT total_pct, ue_cases, ue_total, reg_cases, ot_cases "
+                    "FROM daily WHERE date = ?",
+                    (target_date,),
+                )
+                r = cur.fetchone()
+            finally:
+                conn.close()
+            if not r:
+                return (0.0, 0.0, 0, True)  # read OK, no activity that date
+            total_pct = float(r[0] or 0.0)
+            ue = float(r[1] or 0.0) or float(r[2] or 0.0)  # prefer UE (Cases)
+            cases = int(r[3] or 0) + int(r[4] or 0)
+            return (total_pct, ue, cases, True)
+        except Exception as exc:
+            print(f"[Dashboard team] db read failed for "
+                  f"{os.path.basename(os.path.dirname(db_path))}: {exc}")
+            return None
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _open_summary_resilient(summary_path: str, retries: int = 2):
+        """Open a _Summary.xlsx tolerant of OneDrive placeholders + Excel locks.
+
+        Mirrors sync.downtime_approval._read_workbook: retry with jitter, and
+        on the last attempt fall back to copying the file to a temp path first
+        (dodges the share-lock another machine's open Excel holds). Returns an
+        openpyxl workbook or None if every attempt failed."""
+        import openpyxl  # NOT imported at module scope — must import locally
+        import time as _t
+        import random as _r
+        import shutil as _sh
+        import tempfile as _tf
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                return openpyxl.load_workbook(
+                    summary_path, read_only=True, data_only=True,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries - 1:
+                    _t.sleep(_r.uniform(0.4, 1.6))
+        # Final fallback: copy to temp then open (bypasses a hard file lock).
+        try:
+            tmp = os.path.join(
+                _tf.gettempdir(),
+                f"_teamsum_{os.getpid()}_{abs(hash(summary_path)) % 99999}.xlsx",
+            )
+            _sh.copy2(summary_path, tmp)
+            try:
+                # NOT read_only here: read_only defers row parsing until
+                # iteration, but we delete the temp file immediately below.
+                # Full load pulls everything into memory so the handle is
+                # closed and the temp file is safe to remove right away.
+                return openpyxl.load_workbook(tmp, data_only=True)
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        except Exception as exc:
+            print(f"[Dashboard team] unread {os.path.basename(os.path.dirname(summary_path))}: {last_exc or exc}")
+            return None
 
     @staticmethod
     def _parse_pct(value) -> float:

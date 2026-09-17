@@ -26,8 +26,38 @@ def _qt_message_filter(mode, context, message):
 
 
 qInstallMessageHandler(_qt_message_filter)
-from db.database import init_db, migrate_legacy_db, discover_and_merge_background_dbs
+from db.database import (
+    init_db, migrate_legacy_db, discover_and_merge_background_dbs,
+    backup_db_to_onedrive,
+)
 from sync.app_logger import log_event
+
+
+def _install_crash_guard():
+    """Keep the app alive on unhandled exceptions raised inside Qt slots.
+
+    PySide6 terminates the whole process when a Python exception escapes a
+    slot/callback. A transient "database is locked" on the OneDrive-hosted DB
+    used to take the app down mid-action (the "freeze then close" bug). We log
+    the traceback instead so the window survives and the user can retry.
+    """
+    import traceback
+
+    def _hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            log_event("main", f"Unhandled exception (survived):\n{tb}", level="ERROR")
+        except Exception:
+            pass
+        sys.stderr.write(tb)
+
+    sys.excepthook = _hook
+
+
+_install_crash_guard()
 from tabs.utils import load_units_eq_data
 from tabs.breaks_dialog import (
     init_breaks_table, BreaksDialog, get_breaks,
@@ -448,8 +478,41 @@ class MainWindow(QMainWindow):
 
         # Downtime mutations (add/edit/delete/status) — refresh views that
         # aggregate downtime data so they don't show stale counts.
-        self.register_tab.downtime_changed.connect(self.dashboard_tab.refresh)
-        self.register_tab.downtime_changed.connect(self.history_tab.load_all_cases)
+        #
+        # These refreshes (full Dashboard rebuild + full History reload) are
+        # heavy and used to run SYNCHRONOUSLY on the UI thread on every single
+        # downtime add — freezing the app ~3 s even though those tabs weren't
+        # visible. Instead we mark them "dirty" and only rebuild when the user
+        # actually opens that tab (or, if it's already the current tab, on the
+        # next event-loop tick so the downtime save stays instant).
+        self._dirty_tabs: dict = {}   # {tab_widget: refresh_method_name}
+
+        def _mark_tab_dirty(tab_widget, method_name):
+            self._dirty_tabs[tab_widget] = method_name
+            if self.tabs.currentWidget() is tab_widget:
+                _QTimer.singleShot(
+                    0, lambda w=tab_widget: _refresh_tab_if_dirty(w)
+                )
+
+        def _refresh_tab_if_dirty(tab_widget):
+            method_name = self._dirty_tabs.pop(tab_widget, None)
+            if not method_name:
+                return
+            try:
+                getattr(tab_widget, method_name)()
+            except Exception as exc:
+                log_event("main", f"deferred tab refresh failed: {exc}",
+                          level="WARN")
+
+        def _on_downtime_mutated():
+            _mark_tab_dirty(self.dashboard_tab, "refresh")
+            _mark_tab_dirty(self.history_tab, "load_all_cases")
+
+        self.register_tab.downtime_changed.connect(_on_downtime_mutated)
+        # When a tab becomes visible, refresh it if it went stale while hidden.
+        self.tabs.currentChanged.connect(
+            lambda _i: _refresh_tab_if_dirty(self.tabs.currentWidget())
+        )
 
         # Connect production tab edit/delete to register tab
         self.production_tab.case_updated.connect(self.on_production_case_updated)
@@ -2710,6 +2773,35 @@ if __name__ == "__main__":
                 log_event("main", f"startup backup error: {exc}", level="WARN")
         threading.Thread(target=_bg, daemon=True).start()
     QTimer.singleShot(1500, _run_startup_backup)
+
+    # Durable OneDrive mirror of the LOCAL live DB. The live cases.db now lives
+    # off OneDrive (no more UI freezes), so we push a copy to OneDrive on a
+    # background thread — at startup, every 5 min, and on quit — so a dead PC
+    # never loses data.
+    def _mirror_db_to_onedrive():
+        import threading
+        def _bg():
+            try:
+                ok = backup_db_to_onedrive()
+                if ok:
+                    log_event("main", "DB mirrored to OneDrive")
+            except Exception as exc:
+                log_event("main", f"DB mirror error: {exc}", level="WARN")
+        threading.Thread(target=_bg, daemon=True).start()
+
+    _db_mirror_timer = QTimer()
+    _db_mirror_timer.setInterval(5 * 60 * 1000)  # every 5 minutes
+    _db_mirror_timer.timeout.connect(_mirror_db_to_onedrive)
+    _db_mirror_timer.start()
+    QTimer.singleShot(8000, _mirror_db_to_onedrive)  # first mirror shortly after boot
+    # Final mirror on quit — run SYNCHRONOUSLY (a daemon thread might not finish
+    # before the process exits). Copying a small DB is sub-second.
+    def _mirror_on_quit():
+        try:
+            backup_db_to_onedrive()
+        except Exception as exc:
+            log_event("main", f"quit mirror error: {exc}", level="WARN")
+    app.aboutToQuit.connect(_mirror_on_quit)
 
     # Background DB discovery/merge across common PC paths (time-bounded)
     def _run_background_db_discovery():

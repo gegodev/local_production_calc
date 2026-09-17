@@ -2076,6 +2076,66 @@ def _rebuild_dashboard_file(productions_dir: str, today_str: str,
         _cleanup_onedrive_conflicts(productions_dir)
 
 
+def _pct_to_float(v) -> float:
+    """Parse a possibly-'91.80%' string (or number) to a float."""
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().rstrip("%")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _int_or_zero(v) -> int:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _write_designer_summary_db(designer_dir: str, daily_rows: list) -> None:
+    """Write Productions/<name>/_summary.db ATOMICALLY.
+
+    This is the robust interchange format the Team dashboard prefers over the
+    .xlsx. A reader copies it to temp and opens it with sqlite3 — which never
+    fails on OneDrive placeholders or Excel locks the way openpyxl does, and
+    can't observe a half-written file (we build a temp DB then os.replace()).
+
+    daily_rows: list of 10-tuples
+      (date, week, cases_pct, dt_pct, total_pct, reg_cases, ot_cases,
+       ue_total, ue_cases, last_sync).
+    """
+    import tempfile
+    db_path = os.path.join(designer_dir, "_summary.db")
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=designer_dir)
+    os.close(tmp_fd)
+    try:
+        conn = sqlite3.connect(tmp_path)
+        conn.execute(
+            "CREATE TABLE daily (date TEXT PRIMARY KEY, week TEXT, "
+            "cases_pct REAL, dt_pct REAL, total_pct REAL, "
+            "reg_cases INTEGER, ot_cases INTEGER, ue_total REAL, "
+            "ue_cases REAL, last_sync TEXT)"
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO daily VALUES (?,?,?,?,?,?,?,?,?,?)",
+            daily_rows,
+        )
+        conn.commit()
+        conn.close()
+        os.replace(tmp_path, db_path)   # atomic — readers see all-or-nothing
+    except Exception as exc:
+        log_event("sharepoint_sync", f"_summary.db write failed: {exc}",
+                  level="WARN")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 def _update_team_summary(productions_dir: str, designer: str, target_date: str,
                          total_cases_pct: float, total_downtime_min: float,
                          n_cases: int, n_ot_cases: int,
@@ -2224,6 +2284,33 @@ def _update_team_summary(productions_dir: str, designer: str, target_date: str,
 
     _autowidth(ws)
     wb.save(summary_file)   # fresh file, no lock possible
+
+    # ── Also write a robust SQLite mirror of the daily table ─────────────────
+    # The Team dashboard reads THIS in preference to the .xlsx (see
+    # tab_dashboard._load_team_summaries): sqlite copy-and-open is immune to the
+    # OneDrive-placeholder / Excel-lock failures that make openpyxl silently
+    # drop a designer. Same numbers, robust format.
+    try:
+        db_rows = []
+        for hrow in history_rows:
+            hr = list(hrow) + [None] * 10
+            db_rows.append((
+                hr[0], hr[1],
+                _pct_to_float(hr[2]), _pct_to_float(hr[3]), _pct_to_float(hr[4]),
+                _int_or_zero(hr[5]), _int_or_zero(hr[6]),
+                _pct_to_float(hr[7]), _pct_to_float(hr[8]), "",
+            ))
+        db_rows.append((
+            target_date, f"W{week_num:02d}",
+            float(total_cases_pct), float(dt_pct), float(total_pct),
+            int(n_cases), int(n_ot_cases),
+            round(float(ue_total), 2), round(float(ue_cases), 2),
+            datetime.now().strftime("%H:%M"),
+        ))
+        _write_designer_summary_db(designer_dir, db_rows)
+    except Exception as exc:
+        log_event("sharepoint_sync",
+                  f"could not build _summary.db rows: {exc}", level="WARN")
 
     # ── Step 2: Rebuild _Dashboard.xlsx from all _Summary_*.xlsx ─────────────
     if rebuild_dashboard:
