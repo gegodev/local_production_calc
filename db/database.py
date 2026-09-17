@@ -415,6 +415,22 @@ def backup_db_to_onedrive(keep_last: int = 10) -> bool:
         od_dir = get_onedrive_dir()
         os.makedirs(od_dir, exist_ok=True)
 
+        # Never let an empty/not-yet-migrated local DB overwrite a OneDrive
+        # backup that already has real data — this is the exact scenario
+        # legacy migration exists to avoid: if OneDrive was slow to hydrate
+        # a Files-On-Demand placeholder and migration hasn't finished yet,
+        # DB_PATH can still be a fresh, empty schema at this point. Copying
+        # that over the OneDrive mirror would destroy the only good copy.
+        if not _db_has_data(DB_PATH) and os.path.isfile(ONEDRIVE_DB_PATH) \
+                and _db_has_data(ONEDRIVE_DB_PATH):
+            log_event(
+                "db",
+                "onedrive mirror skipped: local DB is empty but the "
+                "OneDrive copy has data (migration likely still running)",
+                level="WARN",
+            )
+            return False
+
         # Stable mirror (seed for fresh installs / other machines).
         try:
             shutil.copy2(DB_PATH, ONEDRIVE_DB_PATH)

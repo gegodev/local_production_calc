@@ -188,3 +188,78 @@ def test_prune_keeps_only_last_n(tmp_path):
 
     remaining = list(folder.iterdir())
     assert len(remaining) == 5
+
+
+# ── db.database.backup_db_to_onedrive ──────────────────────────────────────────
+
+def test_backup_to_onedrive_refuses_to_clobber_good_remote_with_empty_local(
+    monkeypatch, tmp_path,
+):
+    """The exact scenario this guard exists for: legacy migration hasn't
+    finished seeding the local DB yet (still empty schema), but the OneDrive
+    copy already has real data. The mirror must NOT overwrite it."""
+    import db.database as dbmod
+
+    local_path = str(tmp_path / "local_cases.db")
+    onedrive_path = str(tmp_path / "onedrive_cases.db")
+
+    monkeypatch.setattr(dbmod, "DB_PATH", local_path)
+    monkeypatch.setattr(dbmod, "get_connection", lambda: sqlite3.connect(local_path))
+    dbmod.init_db()  # local: schema only, zero rows
+
+    # "Remote" OneDrive copy already has one real case.
+    monkeypatch.setattr(dbmod, "get_connection", lambda: sqlite3.connect(onedrive_path))
+    dbmod.init_db()
+    remote_conn = sqlite3.connect(onedrive_path)
+    remote_conn.execute(
+        "INSERT INTO cases (case_id, region, tipo_caso, fecha, hora_inicio, hora_fin, "
+        "tiempo_real, std_time, efficiency, estado, case_value) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("REAL001", "ICON", "Primary", "2026-01-10", "09:00", "09:30", 30, 25, 120, "OK", 1.0),
+    )
+    remote_conn.commit()
+    remote_conn.close()
+
+    monkeypatch.setattr(dbmod, "ONEDRIVE_DB_PATH", onedrive_path)
+    monkeypatch.setattr(dbmod, "get_onedrive_dir", lambda: str(tmp_path))
+
+    ok = dbmod.backup_db_to_onedrive()
+
+    assert ok is False
+    # The remote file must be untouched — still has the real row.
+    check = sqlite3.connect(onedrive_path)
+    row = check.execute("SELECT case_id FROM cases").fetchone()
+    check.close()
+    assert row == ("REAL001",)
+
+
+def test_backup_to_onedrive_copies_when_local_has_data(monkeypatch, tmp_path):
+    import db.database as dbmod
+
+    local_path = str(tmp_path / "local_cases.db")
+    onedrive_path = str(tmp_path / "onedrive_cases.db")
+
+    monkeypatch.setattr(dbmod, "DB_PATH", local_path)
+    monkeypatch.setattr(dbmod, "get_connection", lambda: sqlite3.connect(local_path))
+    dbmod.init_db()
+    conn = sqlite3.connect(local_path)
+    conn.execute(
+        "INSERT INTO cases (case_id, region, tipo_caso, fecha, hora_inicio, hora_fin, "
+        "tiempo_real, std_time, efficiency, estado, case_value) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("C900", "ICON", "Primary", "2026-01-10", "09:00", "09:30", 30, 25, 120, "OK", 1.0),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(dbmod, "ONEDRIVE_DB_PATH", onedrive_path)
+    monkeypatch.setattr(dbmod, "get_onedrive_dir", lambda: str(tmp_path))
+
+    ok = dbmod.backup_db_to_onedrive()
+
+    assert ok is True
+    assert os.path.isfile(onedrive_path)
+    check = sqlite3.connect(onedrive_path)
+    row = check.execute("SELECT case_id FROM cases").fetchone()
+    check.close()
+    assert row == ("C900",)

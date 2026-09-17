@@ -2288,7 +2288,21 @@ if __name__ == "__main__":
                 msg = migrate_legacy_db()
             except Exception as exc:
                 log_event("main", f"legacy migration error: {exc}", level="WARN")
-                return
+                msg = ""
+
+            # Only mirror to OneDrive AFTER migration has had its chance to
+            # seed the local DB. Firing the first mirror on a fixed timer
+            # instead used to race migration: if OneDrive was slow to
+            # hydrate the legacy file, DB_PATH could still be empty when the
+            # mirror ran, overwriting the good OneDrive backup with nothing
+            # (backup_db_to_onedrive now also refuses that specific case as
+            # a second line of defense, but doing it in order avoids
+            # relying on that alone).
+            try:
+                backup_db_to_onedrive()
+            except Exception as exc:
+                log_event("main", f"post-migration mirror error: {exc}", level="WARN")
+
             if not msg:
                 return
 
@@ -2338,7 +2352,9 @@ if __name__ == "__main__":
     _db_mirror_timer.setInterval(5 * 60 * 1000)  # every 5 minutes
     _db_mirror_timer.timeout.connect(_mirror_db_to_onedrive)
     _db_mirror_timer.start()
-    QTimer.singleShot(8000, _mirror_db_to_onedrive)  # first mirror shortly after boot
+    # The first mirror runs from _run_legacy_migration's background thread,
+    # right after migrate_legacy_db() — not on a fixed timer here — so it
+    # never fires before migration has had a chance to seed DB_PATH.
     # Final mirror on quit — run SYNCHRONOUSLY (a daemon thread might not finish
     # before the process exits). Copying a small DB is sub-second.
     def _mirror_on_quit():
