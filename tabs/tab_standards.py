@@ -620,7 +620,6 @@ class StandardsTab(QWidget):
             b = QPushButton("  " + text)
             b.setCursor(Qt.PointingHandCursor)
             b.setFixedHeight(30)
-            b.setMinimumWidth(120)
             if _TI_s is not None and icon_svg:
                 try:
                     b.setIcon(_TI_s(icon_svg).icon(color=_QC_s(accent)))
@@ -629,25 +628,34 @@ class StandardsTab(QWidget):
                     pass
             b.setStyleSheet(
                 f"QPushButton {{ background: transparent; border: 1px solid {border};"
-                f"  color: {accent}; border-radius: 6px; padding: 4px 14px;"
+                f"  color: {accent}; border-radius: 6px; padding: 4px 12px;"
                 "  font-weight: 700; font-size: 11px; }}"
                 "QPushButton:hover { background: rgba(30,99,228,0.10); }"
             )
             return b
 
+        def _toolbar_divider():
+            d = _QF_s()
+            d.setFrameShape(_QF_s.Shape.VLine)
+            d.setStyleSheet("color: #21262D;")
+            d.setFixedHeight(20)
+            return d
+
         # Region/type management — password-gated (see _verify_admin_password).
+        # One shared accent (amber) marks the whole group as "restricted";
+        # Delete stays red as the one genuinely destructive action in it.
         add_region_btn = _outline_btn("Add Region", "tabler_plus.svg",
                                       accent="#F0883E", border="#F0883E")
         add_region_btn.clicked.connect(self.add_region)
         add_type_btn = _outline_btn("Add Type", "tabler_pencil_plus.svg",
                                     accent="#F0883E", border="#F0883E")
         add_type_btn.clicked.connect(self.add_type)
+        save_btn = _outline_btn("Save", "tabler_device_floppy.svg",
+                                accent="#F0883E", border="#F0883E")
+        save_btn.clicked.connect(self.save_changes)
         delete_btn = _outline_btn("Delete", "tabler_trash.svg",
                                   accent="#F85149", border="#F85149")
         delete_btn.clicked.connect(self.delete_selected)
-        save_btn = _outline_btn("Save", "tabler_device_floppy.svg",
-                                accent="#3FB950", border="#3FB950")
-        save_btn.clicked.connect(self.save_changes)
 
         import_btn = _outline_btn("Import JSON", "tabler_upload.svg")
         import_btn.clicked.connect(self.import_json)
@@ -669,11 +677,14 @@ class StandardsTab(QWidget):
         toolbar_wrap = QVBoxLayout()
         toolbar_wrap.addStretch(1)
         toolbar_buttons = QHBoxLayout()
-        toolbar_buttons.setSpacing(8)
+        toolbar_buttons.setSpacing(6)
         toolbar_buttons.addWidget(add_region_btn)
         toolbar_buttons.addWidget(add_type_btn)
-        toolbar_buttons.addWidget(delete_btn)
         toolbar_buttons.addWidget(save_btn)
+        toolbar_buttons.addWidget(delete_btn)
+        toolbar_buttons.addSpacing(2)
+        toolbar_buttons.addWidget(_toolbar_divider())
+        toolbar_buttons.addSpacing(2)
         toolbar_buttons.addWidget(import_btn)
         toolbar_buttons.addWidget(export_btn)
         toolbar_buttons.addWidget(snapshots_btn)

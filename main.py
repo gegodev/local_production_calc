@@ -1776,10 +1776,6 @@ if __name__ == "__main__":
     if check_and_install():
         sys.exit(0)
 
-    # ── One-time legacy DB migration (pre-OneDrive path → OneDrive path) ────
-    # Must run BEFORE init_db() so the data is in place before any schema work.
-    _migration_msg = migrate_legacy_db()
-
     init_db()
     # Seed the standards_history table with a baseline snapshot the
     # first time the app boots after this column was added. Cheap no-op
@@ -2276,6 +2272,39 @@ if __name__ == "__main__":
     window.show()
     QTimer.singleShot(400, window._check_first_use)
 
+    # One-time legacy DB migration (pre-local-DB path → local DB), moved off
+    # the startup critical path. The main legacy candidate lives on OneDrive
+    # (see db.database._get_legacy_db_candidates) — checking whether it has
+    # data requires opening it, which forces OneDrive to hydrate the file if
+    # it's a Files-On-Demand placeholder. That used to run BEFORE the window
+    # even existed, so a cold OneDrive cache meant the app appeared to hang
+    # for however long the download took. Now it runs on a background thread
+    # after the window is already up and usable; if it finds something to
+    # merge, the affected tabs refresh and the notice pops up once it's done.
+    def _run_legacy_migration():
+        import threading
+        def _bg():
+            try:
+                msg = migrate_legacy_db()
+            except Exception as exc:
+                log_event("main", f"legacy migration error: {exc}", level="WARN")
+                return
+            if not msg:
+                return
+
+            def _apply():
+                try:
+                    window.register_tab.load_daily_production()
+                    window.production_tab.load_data()
+                    window.history_tab.load_all_cases()
+                    window.dashboard_tab.refresh()
+                except Exception as exc:
+                    log_event("main", f"post-migration refresh failed: {exc}", level="WARN")
+                QMessageBox.information(window, "Datos migrados a OneDrive", msg)
+            QTimer.singleShot(0, _apply)
+        threading.Thread(target=_bg, daemon=True).start()
+    QTimer.singleShot(1200, _run_legacy_migration)
+
     # Startup safety backup (lightweight, background, non-blocking)
     def _run_startup_backup():
         import threading
@@ -2335,7 +2364,7 @@ if __name__ == "__main__":
                 print(f"[main] Background DB discovery error: {exc}")
                 log_event("main", f"background DB discovery error: {exc}", level="WARN")
         threading.Thread(target=_bg, daemon=True).start()
-    QTimer.singleShot(2500, _run_background_db_discovery)
+    QTimer.singleShot(5000, _run_background_db_discovery)
 
     # Check for pending justifications from previous days
     if _PERF_OK and _JUSTIFICATION_ENABLED:
@@ -2346,16 +2375,6 @@ if __name__ == "__main__":
         window.statusBar().showMessage(
             "✓ Production Calc installed — shortcut created on your Desktop.", 8000
         )
-
-    # Notify the user if their data was automatically migrated from the old location
-    if _migration_msg:
-        def _show_migration_notice():
-            QMessageBox.information(
-                window,
-                "Datos migrados a OneDrive",
-                _migration_msg
-            )
-        QTimer.singleShot(800, _show_migration_notice)
 
     sys.exit(app.exec())
 
