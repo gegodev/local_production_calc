@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -6,7 +7,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton, QLabel,
     QTreeWidget, QTreeWidgetItem, QFileDialog, QMessageBox, QLineEdit,
     QHeaderView, QDialog, QFormLayout, QDialogButtonBox, QComboBox,
-    QTableWidget, QTableWidgetItem, QDoubleSpinBox, QCheckBox
+    QTableWidget, QTableWidgetItem, QDoubleSpinBox, QCheckBox, QInputDialog
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
@@ -27,6 +28,29 @@ def _safe_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+# ── Region/type management gate ─────────────────────────────────────────────
+# Only the person who knows this password can add/edit/delete a region or
+# case type — prevents team members from changing shared standard values.
+# Importing a JSON someone else prepared stays open to everyone.
+_ADMIN_PASSWORD_HASH = "4a41a68145d7ad77f4af7ee04fe250daa5d5401ccb9b5fb01e5b0ee7494e8929"
+
+
+def _verify_admin_password(parent) -> bool:
+    """Prompt for the admin password. Returns True only on an exact match."""
+    text, ok = QInputDialog.getText(
+        parent, "Admin password required",
+        "Enter the admin password to manage regions/types:",
+        QLineEdit.EchoMode.Password,
+    )
+    if not ok:
+        return False
+    entered_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if entered_hash != _ADMIN_PASSWORD_HASH:
+        QMessageBox.warning(parent, "Incorrect password", "Wrong password — action cancelled.")
+        return False
+    return True
 
 
 def _normalize_standards_dict(payload):
@@ -611,6 +635,20 @@ class StandardsTab(QWidget):
             )
             return b
 
+        # Region/type management — password-gated (see _verify_admin_password).
+        add_region_btn = _outline_btn("Add Region", "tabler_plus.svg",
+                                      accent="#F0883E", border="#F0883E")
+        add_region_btn.clicked.connect(self.add_region)
+        add_type_btn = _outline_btn("Add Type", "tabler_pencil_plus.svg",
+                                    accent="#F0883E", border="#F0883E")
+        add_type_btn.clicked.connect(self.add_type)
+        delete_btn = _outline_btn("Delete", "tabler_trash.svg",
+                                  accent="#F85149", border="#F85149")
+        delete_btn.clicked.connect(self.delete_selected)
+        save_btn = _outline_btn("Save", "tabler_device_floppy.svg",
+                                accent="#3FB950", border="#3FB950")
+        save_btn.clicked.connect(self.save_changes)
+
         import_btn = _outline_btn("Import JSON", "tabler_upload.svg")
         import_btn.clicked.connect(self.import_json)
         export_btn = _outline_btn("Export JSON", "tabler_download.svg")
@@ -632,6 +670,10 @@ class StandardsTab(QWidget):
         toolbar_wrap.addStretch(1)
         toolbar_buttons = QHBoxLayout()
         toolbar_buttons.setSpacing(8)
+        toolbar_buttons.addWidget(add_region_btn)
+        toolbar_buttons.addWidget(add_type_btn)
+        toolbar_buttons.addWidget(delete_btn)
+        toolbar_buttons.addWidget(save_btn)
         toolbar_buttons.addWidget(import_btn)
         toolbar_buttons.addWidget(export_btn)
         toolbar_buttons.addWidget(snapshots_btn)
@@ -1819,14 +1861,18 @@ class StandardsTab(QWidget):
     
     def edit_selected(self):
         """Edit the currently selected item"""
+        if not _verify_admin_password(self):
+            return
         item = self.tree.currentItem()
         if item and item.parent() is not None:
             self.edit_item(item)
         else:
             QMessageBox.information(self, "Info", "Please select a case type to edit.")
-    
+
     def add_region(self):
         """Add a new region"""
+        if not _verify_admin_password(self):
+            return
         dialog = AddRegionDialog(list(self.standards.keys()), self.standards, self.units_eq, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             data = dialog.get_data()
@@ -1841,6 +1887,8 @@ class StandardsTab(QWidget):
     
     def add_type(self):
         """Add a new case type"""
+        if not _verify_admin_password(self):
+            return
         dialog = AddTypeDialog(list(self.standards.keys()), self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             data = dialog.get_data()
@@ -1859,6 +1907,8 @@ class StandardsTab(QWidget):
     
     def delete_selected(self):
         """Delete the currently selected item"""
+        if not _verify_admin_password(self):
+            return
         item = self.tree.currentItem()
         if not item:
             QMessageBox.information(self, "Info", "Please select an item to delete.")

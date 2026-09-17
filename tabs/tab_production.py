@@ -1049,11 +1049,11 @@ class ProductionTab(QWidget):
         popup.show()
 
     def _on_date_range_changed(self):
-        """When the user picks a new date range, rebuild Region/Type
-        dropdowns so they only contain values present in the new range,
-        then re-apply filters."""
-        self.load_regions_and_types()
-        self.on_filter_changed()
+        """When the user picks a new date range, re-query the DB for that
+        window (load_data is now date-bounded, not a full-history fetch),
+        which also rebuilds the Region/Type dropdowns and re-applies filters."""
+        self.current_page = 1
+        self.load_data()
 
     def _build_case_id_cell(self, *, case_id, suffix, comment,
                              text_color, bold, italic):
@@ -1324,30 +1324,32 @@ class ProductionTab(QWidget):
         self.load_data()
 
     def load_data(self):
+        # Bounded to the currently selected date range — pushing the filter
+        # into SQL (idx_cases_fecha / idx_ot_cases_fecha already exist) keeps
+        # this fast regardless of total history size, instead of fetching
+        # every row ever saved on every single case/OT save.
+        d_from = self.date_from.date().toString("yyyy-MM-dd") \
+            if hasattr(self, "date_from") else None
+        d_to = self.date_to.date().toString("yyyy-MM-dd") \
+            if hasattr(self, "date_to") else None
+
         try:
             conn = get_connection()
             cursor = conn.cursor()
+            table = "cases" if self.current_mode == "reg" else "ot_cases"
+            where = " WHERE fecha BETWEEN ? AND ?" if (d_from and d_to) else ""
+            params = [d_from, d_to] if (d_from and d_to) else []
 
             # `cr_count` and `product_tier` are new optional columns —
             # older DBs may lack them. COALESCE returns sensible defaults.
-            if self.current_mode == "reg":
-                cursor.execute("""
-                    SELECT id, case_id, doctor, region, tipo_caso, fecha, hora_inicio, hora_fin,
-                           tiempo_real, efficiency, estado, case_value, count_production, comments,
-                           cr_count,
-                           COALESCE(product_tier, '')
-                    FROM cases
-                    ORDER BY id DESC
-                """)
-            else:  # OT mode
-                cursor.execute("""
-                    SELECT id, case_id, doctor, region, tipo_caso, fecha, hora_inicio, hora_fin,
-                           tiempo_real, efficiency, estado, case_value, count_production, comments,
-                           cr_count,
-                           COALESCE(product_tier, '')
-                    FROM ot_cases
-                    ORDER BY id DESC
-                """)
+            cursor.execute(f"""
+                SELECT id, case_id, doctor, region, tipo_caso, fecha, hora_inicio, hora_fin,
+                       tiempo_real, efficiency, estado, case_value, count_production, comments,
+                       cr_count,
+                       COALESCE(product_tier, '')
+                FROM {table}{where}
+                ORDER BY id DESC
+            """, params)
 
             self.all_cases = cursor.fetchall()
             conn.close()

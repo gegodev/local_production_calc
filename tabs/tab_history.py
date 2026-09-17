@@ -287,7 +287,7 @@ class HistoryTab(QWidget):
         # checkbox controls whether the date filter is APPLIED — not
         # whether the input is interactable.
         self.specific_date.setEnabled(True)
-        self.specific_date.dateChanged.connect(self.on_filter_changed)
+        self.specific_date.dateChanged.connect(self._on_specific_date_value_changed)
         _attach_cal(self.specific_date)
         sd_inner = QWidget()
         sd_inner_lay = QHBoxLayout(sd_inner)
@@ -652,6 +652,23 @@ class HistoryTab(QWidget):
         self.filter_type.addItems(types)
 
     def load_all_cases(self):
+        # "Specific date" is a real narrow filter (unlike the hidden, always-
+        # wide date_from/date_to) — push it into SQL so picking one day
+        # doesn't still pay for fetching the entire history first. Default
+        # (no specific date) stays intentionally unbounded: "From/To removed
+        # — only Specific date filters by exact day" (see date_from/date_to
+        # setup above).
+        use_specific_date = (
+            hasattr(self, "specific_date_check")
+            and self.specific_date_check.isChecked()
+        )
+        where = ""
+        params: list = []
+        if use_specific_date:
+            where = "WHERE fecha = ?"
+            specific = self.specific_date.date().toString("yyyy-MM-dd")
+            params = [specific, specific]  # one per UNION ALL branch
+
         try:
             conn = get_connection()
             cursor = conn.cursor()
@@ -660,24 +677,24 @@ class HistoryTab(QWidget):
             # day they were registered — OT no longer drifts to the end
             # just because its ids live in a separate sequence. Use
             # hora_inicio + case_id as tie-breakers within a day.
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT * FROM (
                     SELECT id, case_id, doctor, region, tipo_caso,
                            fecha, tiempo_real, std_time, efficiency, estado, case_value,
                            COALESCE(count_production, 1) as count_production,
                            'reg' as source, comments,
                            COALESCE(hora_inicio, '00:00') AS _ord_hh
-                    FROM cases
+                    FROM cases {where}
                     UNION ALL
                     SELECT id, case_id, doctor, region, tipo_caso,
                            fecha, tiempo_real, std_time, efficiency, estado, case_value,
                            COALESCE(count_production, 1) as count_production,
                            'ot' as source, comments,
                            COALESCE(hora_inicio, '00:00') AS _ord_hh
-                    FROM ot_cases
+                    FROM ot_cases {where}
                 )
                 ORDER BY fecha DESC, _ord_hh DESC, case_id DESC
-            """)
+            """, params)
             self.all_cases = cursor.fetchall()
             conn.close()
         except Exception as exc:
@@ -828,9 +845,18 @@ class HistoryTab(QWidget):
     
     def on_specific_date_toggled(self, state):
         """The date picker stays editable at all times. The checkbox only
-        toggles whether the chosen date filters the table — re-render
-        the list once the state flips."""
-        self.on_filter_changed()
+        toggles whether the chosen date filters the table — re-query so
+        checking it actually benefits from the date-bound SQL fetch instead
+        of re-filtering whatever was cached before."""
+        self.current_page = 1
+        self.load_all_cases()
+
+    def _on_specific_date_value_changed(self):
+        """The picker's value only matters when the checkbox is active —
+        re-query then (bound fetch); otherwise it's inert, don't hit the DB."""
+        if self.specific_date_check.isChecked():
+            self.current_page = 1
+            self.load_all_cases()
 
     def prev_page(self):
         if self.current_page > 1:
